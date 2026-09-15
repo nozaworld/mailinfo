@@ -1,76 +1,89 @@
 # mailinfo
 
-指定した Maildir を監視し、対象メーリングリストの件名だけを Discord webhook に通知する小さな Go アプリです。
+<p style="display: inline">
+	<img src="https://img.shields.io/badge/-Go-00ADD8.svg?logo=go&style=for-the-badge&logoColor=white">
+	<img src="https://img.shields.io/badge/-Discord-5865F2.svg?logo=discord&style=for-the-badge&logoColor=white">
+</p>
 
-## 仕様
+このプロジェクトは，Maildirを定期的に監視し，条件に一致する新着メールの件名をDiscord Webhookへ通知する常駐プログラムです．Go標準ライブラリのみで実装しており，メールサーバーやデータベースを別途用意せずに動作します．
 
-- 平日 6:00 以上 22:00 未満にだけ動作します。
-- 1分おきに `MAILDIR_PATH` で指定した Maildir を確認します。
-- Discord へ送る本文は件名のみです。
-- 件名が空の場合は `None` を送ります。
-- 処理済み Maildir key を `STATE_FILE` に保存し、再起動後の二重通知を避けます。
-- 初回起動時は既存メールを通知せず、その時点で存在するメールを処理済みにします。
-- `REQUIRE_STAFF_ADDRESS=true` の場合、`STAFF_ADDRESS` に関係するメールだけを通知します。
-- `EXCLUDE_FILE` に改行区切りで書いた正規表現に From アドレスが一致した場合は通知しません。
-- 件名中のメールアドレスは、`@` より前にある小文字アルファベットを削除してから通知します。
+## 概要
 
-例:
+`MAILDIR_PATH`で指定したMaildirの`new/`と`cur/`を定期的に走査し，未処理のメールを検出します．平日かつ指定した時間帯に，宛先と送信元の条件を満たしたメールの件名をDiscordへ投稿します．
 
-```text
-contact abc123@example.com
+主な機能として，以下を扱います．
+
+- Maildirの`new/`および`cur/`にあるメールの定期監視
+- `To`，`Cc`，`Delivered-To`などのヘッダーによる宛先判定
+- メーリングリストの`local.domain`，`local-request@domain`，`local-owner@domain`形式への対応
+- 正規表現ファイルによる送信元の除外
+- 平日および業務時間帯による通知制限
+- 通知済みメールキーのJSONファイル管理
+- 件名内メールアドレスのサニタイズ
+- Discord Webhookへの新着メール件名の通知
+
+## 制約
+
+- 監視対象はMaildir形式で，`new/`または`cur/`ディレクトリが必要です．
+- 初回起動時は，既存メールを通知済みとして状態ファイルへ登録します．既存メールを遡って通知する機能はありません．
+- 通知済み判定はMaildirファイル名から生成したキーに依存します．状態ファイルを削除すると，状態が失われます．
+- 通知は平日の指定時間帯だけ行われ，土曜日と日曜日は通知しません．
+- 複数プロセスによる同一状態ファイルの同時更新は想定していません．
+- 通知先はDiscord Webhookに限定しており，Slackなど他の通知先には対応していません．
+
+## 要件
+
+- Go `1.26`系
+- 読み取り可能なMaildir
+- 状態ファイルを書き込めるディレクトリ
+- 通知先のDiscord Webhook URL
+
+## 使い方
+
+1. リポジトリをクローンします．
+
+```bash
+git clone https://github.com/nozaworld/mailinfo.git
+cd mailinfo
 ```
 
-は次のように通知されます。
+2. `.env.example`を参考に環境変数を設定します．`.env`を使用する場合は，シェルから読み込んでください．
 
-```text
-contact 123@example.com
+```bash
+cp .env.example .env
+# .envの値を環境に合わせて編集
+set -a
+. ./.env
+set +a
 ```
 
-## 設定
+3. ビルドして起動します．
 
-`.env.example` を参考に、systemd の `EnvironmentFile` などで環境変数を渡してください。
-
-必須:
-
-```sh
-DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-MAILDIR_PATH="/home/notify-user/Maildir"
-STAFF_ADDRESS="staff@example.test"
-```
-
-任意:
-
-```sh
-REQUIRE_STAFF_ADDRESS="true"
-TIMEZONE="Asia/Tokyo"
-WORK_START_HOUR="6"
-WORK_END_HOUR="22"
-POLL_INTERVAL="1m"
-STATE_FILE="private/state.json"
-EXCLUDE_FILE="private/exclude_senders.txt"
-```
-
-メールサーバ上で Maildir を直接読むため、IMAP のユーザー名やパスワードは不要です。
-
-## 除外フィルタ
-
-`private/exclude_senders.txt` に、通知しない送信者アドレスの正規表現を1行ずつ書きます。
-
-```text
-# コメントと空行は無視されます
-^noreply@example\.com$
-@example\.invalid$
-```
-
-## ビルド
-
-```sh
+```bash
 go build -o mailinfo .
+./mailinfo
 ```
 
-## systemd 例
+プログラムは終了するまで常駐し，処理状況やスキップ理由を標準ログへ出力します．設定値が不足している場合や，タイムゾーン・間隔・時刻の形式が不正な場合は起動時に終了します．
 
-`/etc/systemd/system/mailinfo.service`:
+### SSHでの本番環境テスト
+
+本番サーバーへSSH接続し，まずフォアグラウンドで起動して設定と通知を確認します．`/opt/mailinfo`に配置した場合の例です．
+
+```bash
+ssh user@example.com
+cd /opt/mailinfo
+set -a
+. ./.env
+set +a
+./mailinfo
+```
+
+起動後は標準ログを確認し，テスト用メールを対象Maildirへ送信してDiscordへ通知されることを確認します．確認が終わったら`Ctrl+C`で停止します．`.env`にはDiscord Webhook URLなどの秘密情報が含まれるため，ファイルの権限を適切に設定してください．
+
+## systemdでの運用
+
+本番環境で常駐運用する場合は，systemdのサービスとして登録します．次の内容を`/etc/systemd/system/mailinfo.service`に保存してください．
 
 ```ini
 [Unit]
@@ -85,14 +98,85 @@ EnvironmentFile=/opt/mailinfo/.env
 ExecStart=/opt/mailinfo/mailinfo
 Restart=always
 RestartSec=10
+User=root
+Group=root
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-反映:
+サービスを登録して起動します．
 
-```sh
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now mailinfo.service
 ```
+
+稼働状態とログは次のコマンドで確認できます．
+
+```bash
+sudo systemctl status mailinfo.service
+sudo journalctl -u mailinfo.service -f
+```
+
+設定やバイナリを更新した場合は，サービスを再起動します．
+
+```bash
+sudo systemctl restart mailinfo.service
+```
+
+停止または自動起動の無効化を行う場合は，次のコマンドを使用します．
+
+```bash
+sudo systemctl disable --now mailinfo.service
+```
+
+### 環境変数
+
+| 環境変数 | 必須 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `DISCORD_WEBHOOK_URL` | はい | なし | 通知先Discord WebhookのURL |
+| `MAILDIR_PATH` | はい | なし | 監視するMaildirのパス |
+| `STAFF_ADDRESS` | 条件付き | なし | 宛先判定に使うメールアドレス |
+| `REQUIRE_STAFF_ADDRESS` | いいえ | `true` | `false`などを指定すると宛先判定を無効化 |
+| `TIMEZONE` | いいえ | `Asia/Tokyo` | 業務時間と曜日の判定に使うタイムゾーン |
+| `WORK_START_HOUR` | いいえ | `6` | 通知を開始する時刻 |
+| `WORK_END_HOUR` | いいえ | `22` | 通知を終了する時刻（終了時刻は含まない） |
+| `POLL_INTERVAL` | いいえ | `1m` | Maildirを確認する間隔（Goのduration形式） |
+| `STATE_FILE` | いいえ | `private/state.json` | 通知済みメールキーの保存先 |
+| `EXCLUDE_FILE` | いいえ | `private/exclude_senders.txt` | 送信元除外正規表現ファイル |
+
+`REQUIRE_STAFF_ADDRESS`が有効な場合，`STAFF_ADDRESS`は必須です．`.env`やDiscord Webhook URLは公開しないでください．
+
+### 送信元除外ファイル
+
+`EXCLUDE_FILE`には，1行につき1つの正規表現を記述します．空行と`#`で始まる行は無視されます．
+
+```text
+# example: automated senders
+no-reply@example\.com$
+mailer-daemon@.*
+```
+
+## テスト
+
+```bash
+go test ./...
+```
+
+`main_test.go`で，件名のサニタイズ，通知時間帯，宛先判定のテストを実施しています．
+
+## プロジェクト構成
+
+- `main.go`
+	設定読み込み，Maildir走査，メールヘッダー解析，フィルタ，状態管理，Discord通知
+- `main_test.go`
+	主要な判定ロジックのテスト
+- `.env.example`
+	環境変数の設定例
+- `private/`
+	状態ファイルや送信元除外設定など，公開しない運用データの配置先
+
+## ライセンス
+
+このプロジェクトはMITライセンスのもとで公開されています．詳細は[LICENSE](./LICENSE)を参照してください．

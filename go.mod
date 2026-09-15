@@ -1,3 +1,3 @@
 module github.com/nozaworld/mailinfo
 
-go 1.27.1
+go 1.26.7

@@ -1,8 +1,11 @@
 # 環境設定ファイル
 .env
 
-# provateディレクトリ
+# privateディレクトリ
 private/*
+
+# ビルド済みバイナリ
+mailinfo
 
 # dbファイル
 *.db
