@@ -1,0 +1,8 @@
+# 環境設定ファイル
+.env
+
+# provateディレクトリ
+private/*
+
+# dbファイル
+*.db
