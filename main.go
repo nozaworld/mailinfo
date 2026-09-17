@@ -22,7 +22,14 @@ import (
 )
 
 type config struct {
-	DiscordWebhookURL string
+	// DiscordWebhookURLs は，通知先の名前（target）とDiscord Webhook URLの対応表．
+	// "default"は，DiscordRouteFileのどのルールにもマッチしなかった場合に使う
+	// 既定の通知先名（DiscordDefaultTargetで変更可能）．
+	DiscordWebhookURLs map[string]string
+	DiscordRouteFile   string
+	// DiscordDefaultTarget は，ルールにマッチしなかった場合に使う
+	// DiscordWebhookURLsのキー名．
+	DiscordDefaultTarget string
 
 	MaildirPath  string
 	StaffAddress string
@@ -35,6 +42,10 @@ type config struct {
 	RequireStaff bool
 }
 
+// skipTarget は，DiscordRouteFile内のルールで使う予約されたtarget名．
+// このtargetにマッチしたメールは，どのDiscord Webhookへも通知せずスキップする．
+const skipTarget = "skip"
+
 type state struct {
 	Seen map[string]bool `json:"seen"`
 }
@@ -45,10 +56,27 @@ type messageHeader struct {
 	Subject   string
 	From      string
 	Recipient string
+	Body      string
 }
 
 var emailTokenRE = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
 var lowercaseRE = regexp.MustCompile(`[a-z]`)
+
+// routeCondition は，ルーティングルールの1つの条件を表す．
+// fieldは"from"，"subject"，"body"，"text"（件名と本文を結合したもの）のいずれか．
+// Negateがtrueの場合，正規表現に一致しないことが条件となる．
+type routeCondition struct {
+	Field  string
+	Regex  *regexp.Regexp
+	Negate bool
+}
+
+// discordRoute は，複数のroute condition（すべて満たした場合にマッチ，AND条件）と，
+// マッチした場合の通知先target名（DiscordWebhookURLsのキー，またはskipTarget）を表す．
+type discordRoute struct {
+	Conditions []routeCondition
+	Target     string
+}
 
 func main() {
 	cfg, err := loadConfig()
@@ -57,6 +85,11 @@ func main() {
 	}
 
 	filters, err := loadExcludeFilters(cfg.ExcludeFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	routes, err := loadDiscordRoutes(cfg.DiscordRouteFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -87,7 +120,7 @@ func main() {
 	defer ticker.Stop()
 
 	for {
-		if err := pollOnce(cfg, filters, &st); err != nil {
+		if err := pollOnce(cfg, filters, routes, &st); err != nil {
 			log.Printf("poll failed: %v", err)
 		}
 		<-ticker.C
@@ -118,22 +151,40 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("WORK_START_HOUR and WORK_END_HOUR must satisfy 0 <= start < end <= 24")
 	}
 
+	webhookURLs, err := parseWebhookURLs(os.Getenv("DISCORD_WEBHOOK_URLS"))
+	if err != nil {
+		return config{}, err
+	}
+	// DISCORD_WEBHOOK_URLは後方互換のため残しており，指定された場合は
+	// "default"という名前でwebhookURLsへ登録する（DISCORD_WEBHOOK_URLSで
+	// 明示的に"default"が定義されていれば，そちらを優先する）．
+	if legacyURL := os.Getenv("DISCORD_WEBHOOK_URL"); legacyURL != "" {
+		if webhookURLs == nil {
+			webhookURLs = map[string]string{}
+		}
+		if _, ok := webhookURLs["default"]; !ok {
+			webhookURLs["default"] = legacyURL
+		}
+	}
+
 	cfg := config{
-		DiscordWebhookURL: os.Getenv("DISCORD_WEBHOOK_URL"),
-		MaildirPath:       os.Getenv("MAILDIR_PATH"),
-		StaffAddress:      strings.ToLower(os.Getenv("STAFF_ADDRESS")),
-		StateFile:         getenvDefault("STATE_FILE", "private/state.json"),
-		ExcludeFile:       getenvDefault("EXCLUDE_FILE", "private/exclude_senders.txt"),
-		PollInterval:      pollInterval,
-		Location:          loc,
-		StartHour:         startHour,
-		EndHour:           endHour,
-		RequireStaff:      getenvBool("REQUIRE_STAFF_ADDRESS", true),
+		DiscordWebhookURLs:   webhookURLs,
+		DiscordRouteFile:     getenvDefault("DISCORD_ROUTE_FILE", "private/discord_routes.txt"),
+		DiscordDefaultTarget: getenvDefault("DISCORD_DEFAULT_TARGET", "default"),
+		MaildirPath:          os.Getenv("MAILDIR_PATH"),
+		StaffAddress:         strings.ToLower(os.Getenv("STAFF_ADDRESS")),
+		StateFile:            getenvDefault("STATE_FILE", "private/state.json"),
+		ExcludeFile:          getenvDefault("EXCLUDE_FILE", "private/exclude_senders.txt"),
+		PollInterval:         pollInterval,
+		Location:             loc,
+		StartHour:            startHour,
+		EndHour:              endHour,
+		RequireStaff:         getenvBool("REQUIRE_STAFF_ADDRESS", true),
 	}
 
 	var missing []string
-	if cfg.DiscordWebhookURL == "" {
-		missing = append(missing, "DISCORD_WEBHOOK_URL")
+	if len(cfg.DiscordWebhookURLs) == 0 {
+		missing = append(missing, "DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URLS")
 	}
 	if cfg.MaildirPath == "" {
 		missing = append(missing, "MAILDIR_PATH")
@@ -149,7 +200,35 @@ func loadConfig() (config, error) {
 	return cfg, nil
 }
 
-func pollOnce(cfg config, filters []*regexp.Regexp, st *state) error {
+// parseWebhookURLs は，DISCORD_WEBHOOK_URLSの値（"name1=url1,name2=url2"形式）を
+// target名とURLのマップへ変換する．空文字列の場合はnilを返す．
+func parseWebhookURLs(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	urls := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		name, url, ok := strings.Cut(pair, "=")
+		name = strings.TrimSpace(name)
+		url = strings.TrimSpace(url)
+		if !ok || name == "" || url == "" {
+			return nil, fmt.Errorf("invalid DISCORD_WEBHOOK_URLS entry %q: want name=url", pair)
+		}
+		if name == skipTarget {
+			return nil, fmt.Errorf("invalid DISCORD_WEBHOOK_URLS entry %q: %q is a reserved target name", pair, skipTarget)
+		}
+		urls[name] = url
+	}
+	return urls, nil
+}
+
+func pollOnce(cfg config, filters []*regexp.Regexp, routes []discordRoute, st *state) error {
 	now := time.Now().In(cfg.Location)
 	if !withinWindow(now, cfg.StartHour, cfg.EndHour) {
 		return nil
@@ -177,17 +256,78 @@ func pollOnce(cfg config, filters []*regexp.Regexp, st *state) error {
 			continue
 		}
 
+		target := resolveTarget(routes, msg)
+		if target == "" {
+			target = cfg.DiscordDefaultTarget
+		}
+		if target == skipTarget {
+			log.Printf("skip %s: routed to %q", msg.Key, skipTarget)
+			continue
+		}
+
+		webhookURL, ok := cfg.DiscordWebhookURLs[target]
+		if !ok || webhookURL == "" {
+			log.Printf("skip %s: no webhook URL registered for target %q", msg.Key, target)
+			continue
+		}
+
 		content := sanitizeSubject(msg.Subject)
-		if err := postDiscord(cfg.DiscordWebhookURL, content); err != nil {
+		if err := postDiscord(webhookURL, content); err != nil {
 			return fmt.Errorf("notify %s: %w", msg.Key, err)
 		}
-		log.Printf("notified %s", msg.Key)
+		log.Printf("notified %s (target=%s)", msg.Key, target)
 	}
 
 	if changed {
 		return saveState(cfg.StateFile, *st)
 	}
 	return nil
+}
+
+// routeFieldValue は，msgからroute conditionのfieldに対応する文字列を取り出す．
+// "text"は件名と本文を改行で結合したものを表す．
+func routeFieldValue(field string, msg messageHeader) (string, bool) {
+	switch field {
+	case "from":
+		return msg.From, true
+	case "subject":
+		return msg.Subject, true
+	case "body":
+		return msg.Body, true
+	case "text":
+		return msg.Subject + "\n" + msg.Body, true
+	default:
+		return "", false
+	}
+}
+
+// resolveTarget は，メールの内容をルールに照らし合わせ，最初にマッチしたルールの
+// target名を返す．各ルールは，すべての条件（Conditions）を満たした場合にのみ
+// マッチする（AND）．Negateが指定された条件は，正規表現に一致しない場合にマッチする．
+// どのルールにもマッチしない場合は空文字列を返す．
+func resolveTarget(routes []discordRoute, msg messageHeader) string {
+	for _, route := range routes {
+		matched := true
+		for _, cond := range route.Conditions {
+			value, ok := routeFieldValue(cond.Field, msg)
+			if !ok {
+				matched = false
+				break
+			}
+			isMatch := cond.Regex.MatchString(value)
+			if cond.Negate {
+				isMatch = !isMatch
+			}
+			if !isMatch {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return route.Target
+		}
+	}
+	return ""
 }
 
 func withinWindow(t time.Time, startHour, endHour int) bool {
@@ -240,7 +380,8 @@ func parseMessageHeader(path string) (messageHeader, error) {
 	}
 	defer file.Close()
 
-	header, err := textproto.NewReader(bufio.NewReader(file)).ReadMIMEHeader()
+	reader := bufio.NewReader(file)
+	header, err := textproto.NewReader(reader).ReadMIMEHeader()
 	if err != nil && !errors.Is(err, io.EOF) {
 		return messageHeader{}, err
 	}
@@ -255,10 +396,18 @@ func parseMessageHeader(path string) (messageHeader, error) {
 		subject = header.Get("Subject")
 	}
 
+	// 本文は生の状態（文字エンコードやマルチパートの分解を行わない）で保持する．
+	// ルーティング用の単純な文字列照合にのみ使用する．
+	bodyBytes, err := io.ReadAll(reader)
+	if err != nil {
+		return messageHeader{}, err
+	}
+
 	return messageHeader{
 		Subject:   subject,
 		From:      from,
 		Recipient: recipientHeaders(header),
+		Body:      string(bodyBytes),
 	}, nil
 }
 
@@ -356,6 +505,84 @@ func loadExcludeFilters(path string) ([]*regexp.Regexp, error) {
 		return nil, fmt.Errorf("read exclude file: %w", err)
 	}
 	return filters, nil
+}
+
+// loadDiscordRoutes は，DiscordRouteFileからルーティングルールを読み込む．
+// 各行はタブ区切りで，最後の要素をtarget，それ以外の要素を条件として扱う．
+// 条件は"field:regex"（一致することが条件）または"!field:regex"（一致しないことが
+// 条件）の形式で指定し，1行内のすべての条件を満たした場合にのみマッチする（AND）．
+// fieldは"from"，"subject"，"body"，"text"（件名と本文の結合）のいずれか．
+// targetには，DISCORD_WEBHOOK_URLSで定義したtarget名，またはskipTarget（"skip"，
+// 通知をスキップする予約語）を指定する．
+// 空行と"#"で始まる行は無視する．ファイルが存在しない場合はルールなしとして扱う．
+func loadDiscordRoutes(path string) ([]discordRoute, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open discord route file: %w", err)
+	}
+	defer file.Close()
+
+	var routes []discordRoute
+	scanner := bufio.NewScanner(file)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.Split(line, "\t")
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("parse discord route %s:%d: expected \"field:regex<TAB>...<TAB>target\"", path, lineNo)
+		}
+
+		target := strings.TrimSpace(fields[len(fields)-1])
+		if target == "" {
+			return nil, fmt.Errorf("parse discord route %s:%d: missing target", path, lineNo)
+		}
+
+		var conditions []routeCondition
+		for _, raw := range fields[:len(fields)-1] {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+
+			negate := strings.HasPrefix(raw, "!")
+			raw = strings.TrimPrefix(raw, "!")
+
+			field, pattern, ok := strings.Cut(raw, ":")
+			if !ok {
+				return nil, fmt.Errorf("parse discord route %s:%d: expected \"field:regex\"", path, lineNo)
+			}
+			field = strings.TrimSpace(field)
+			switch field {
+			case "from", "subject", "body", "text":
+			default:
+				return nil, fmt.Errorf("parse discord route %s:%d: unknown field %q (want from, subject, body, or text)", path, lineNo, field)
+			}
+
+			regex, err := regexp.Compile(pattern)
+			if err != nil {
+				return nil, fmt.Errorf("compile discord route regex %s:%d: %w", path, lineNo, err)
+			}
+
+			conditions = append(conditions, routeCondition{Field: field, Regex: regex, Negate: negate})
+		}
+		if len(conditions) == 0 {
+			return nil, fmt.Errorf("parse discord route %s:%d: at least one condition is required", path, lineNo)
+		}
+
+		routes = append(routes, discordRoute{Conditions: conditions, Target: target})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read discord route file: %w", err)
+	}
+	return routes, nil
 }
 
 func loadState(path string) (state, bool, error) {

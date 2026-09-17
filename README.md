@@ -20,6 +20,7 @@
 - 平日および業務時間帯による通知制限
 - 通知済みメールキーのJSONファイル管理
 - 件名内メールアドレスのサニタイズ
+- 差出人・件名・本文の条件によるDiscord通知先の振り分け（送信スキップを含む）
 - Discord Webhookへの新着メール件名の通知
 
 ## 制約
@@ -135,7 +136,10 @@ sudo systemctl disable --now mailinfo.service
 
 | 環境変数 | 必須 | 既定値 | 説明 |
 | --- | --- | --- | --- |
-| `DISCORD_WEBHOOK_URL` | はい | なし | 通知先Discord WebhookのURL |
+| `DISCORD_WEBHOOK_URL` | 条件付き | なし | 後方互換用の単一Webhook URL．指定すると`default`という名前で`DISCORD_WEBHOOK_URLS`に登録される |
+| `DISCORD_WEBHOOK_URLS` | 条件付き | なし | 通知先target名とWebhook URLの対応表（`name1=url1,name2=url2`形式） |
+| `DISCORD_ROUTE_FILE` | いいえ | `private/discord_routes.txt` | 通知先振り分けルールファイル |
+| `DISCORD_DEFAULT_TARGET` | いいえ | `default` | どのルールにも一致しなかった場合に使うtarget名 |
 | `MAILDIR_PATH` | はい | なし | 監視するMaildirのパス |
 | `STAFF_ADDRESS` | 条件付き | なし | 宛先判定に使うメールアドレス |
 | `REQUIRE_STAFF_ADDRESS` | いいえ | `true` | `false`などを指定すると宛先判定を無効化 |
@@ -146,7 +150,7 @@ sudo systemctl disable --now mailinfo.service
 | `STATE_FILE` | いいえ | `private/state.json` | 通知済みメールキーの保存先 |
 | `EXCLUDE_FILE` | いいえ | `private/exclude_senders.txt` | 送信元除外正規表現ファイル |
 
-`REQUIRE_STAFF_ADDRESS`が有効な場合，`STAFF_ADDRESS`は必須です．`.env`やDiscord Webhook URLは公開しないでください．
+`REQUIRE_STAFF_ADDRESS`が有効な場合，`STAFF_ADDRESS`は必須です．`DISCORD_WEBHOOK_URL`と`DISCORD_WEBHOOK_URLS`は，どちらか一方，または両方を指定する必要があります．`.env`やDiscord Webhook URLは公開しないでください．
 
 ### 送信元除外ファイル
 
@@ -157,6 +161,36 @@ sudo systemctl disable --now mailinfo.service
 no-reply@example\.com$
 mailer-daemon@.*
 ```
+
+### Discord通知先のルーティング
+
+`DISCORD_WEBHOOK_URLS`で複数のDiscord Webhook URLをtarget名付きで登録しておき，`DISCORD_ROUTE_FILE`（既定は`private/discord_routes.txt`）に，差出人・件名・本文の条件で通知先を振り分けるルールを記述します．target名の追加・削除は`DISCORD_WEBHOOK_URLS`の値を変更するだけで行え，振り分け条件の追加・削除は`DISCORD_ROUTE_FILE`の行を増減するだけで行えます．
+
+`DISCORD_WEBHOOK_URLS`は，`name1=url1,name2=url2`のようにカンマ区切りで指定します．
+
+```dotenv
+DISCORD_WEBHOOK_URLS="A=https://discord.com/api/webhooks/AAA/TOKEN,B=https://discord.com/api/webhooks/BBB/TOKEN,C=https://discord.com/api/webhooks/CCC/TOKEN,D=https://discord.com/api/webhooks/DDD/TOKEN"
+DISCORD_DEFAULT_TARGET="D"
+```
+
+`DISCORD_ROUTE_FILE`には，1行につき1ルールを記述します．タブ区切りで複数の条件を並べ，最後の要素をtargetとします．同じ行内の条件はすべてを満たした場合にのみマッチします（AND）．条件は`field:regex`（一致すればマッチ）または`!field:regex`（一致しなければマッチ）の形式で指定し，`field`には`from`（差出人），`subject`（件名），`body`（本文，MIMEデコード前の生テキスト），`text`（件名と本文を結合したもの）を指定できます．ルールは上から順に評価し，最初にマッチした行のtargetを採用します．targetに`skip`を指定すると，そのメールはどのDiscord Webhookへも通知しません．どの行にもマッチしない場合は，`DISCORD_DEFAULT_TARGET`に対応するURLへ通知します．target名に対応するURLが`DISCORD_WEBHOOK_URLS`に見つからない場合は，通知をスキップします．target名は`DISCORD_WEBHOOK_URLS`のキー名と1文字も違わず一致させる必要があります．
+
+次の例は，学内（`.nagoya-u.ac.jp`）・生協（`coop.`）ドメイン以外の差出人を通知対象から除外し，差出人ごと・キーワードごとにDiscordの通知先を振り分けます（`private/discord_routes.txt`の実際の内容）．
+
+```text
+# field:regex[<TAB>field:regex...]<TAB>target
+!from:@(?:[^@]*\.)?nagoya-u\.ac\.jp$	!from:@coop\.	skip
+
+from:^managers@nagoya-u\.ac\.jp$	B
+
+from:^nagios@.*coop\.nagoya-u\.ac\.jp$	C
+from:^staff@	C
+from:^ipdb-admin@icts\.nagoya-u\.ac\.jp$	C
+
+text:(お願い|トラブル|していただ)	A
+```
+
+ブラックリストによる除外は，既存の`EXCLUDE_FILE`（送信元除外ファイル）で判定されるため，このファイルには含めていません．空行と`#`で始まる行は無視されます．
 
 ## テスト
 
@@ -169,7 +203,7 @@ go test ./...
 ## プロジェクト構成
 
 - `main.go`
-	設定読み込み，Maildir走査，メールヘッダー解析，フィルタ，状態管理，Discord通知
+	設定読み込み，Maildir走査，メールヘッダー解析，フィルタ，通知先ルーティング，状態管理，Discord通知
 - `main_test.go`
 	主要な判定ロジックのテスト
 - `.env.example`
