@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -226,5 +227,85 @@ func TestLoadDiscordRoutes(t *testing.T) {
 	missing, err := loadDiscordRoutes(filepath.Join(dir, "does-not-exist.txt"))
 	if err != nil || missing != nil {
 		t.Fatalf("loadDiscordRoutes(missing file) = %v, %v, want nil, nil", missing, err)
+	}
+}
+
+func TestRouteFieldValueHeader(t *testing.T) {
+	msg := messageHeader{
+		From: "staff-sender@coop.nagoya-u.ac.jp",
+		Header: textproto.MIMEHeader{
+			"X-Original-From": []string{"managers@nagoya-u.ac.jp"},
+		},
+	}
+	value, ok := routeFieldValue("header:X-Original-From", msg)
+	if !ok || value != "managers@nagoya-u.ac.jp" {
+		t.Fatalf("routeFieldValue() = %q, %v, want %q, true", value, ok, "managers@nagoya-u.ac.jp")
+	}
+
+	if _, ok := routeFieldValue("header:", msg); ok {
+		t.Fatal("routeFieldValue(\"header:\") expected ok=false")
+	}
+
+	value, ok = routeFieldValue("header:X-Nonexistent", msg)
+	if !ok || value != "" {
+		t.Fatalf("routeFieldValue() for missing header = %q, %v, want empty string, true", value, ok)
+	}
+}
+
+func TestResolveTargetWithHeaderFallback(t *testing.T) {
+	routes := []discordRoute{
+		{
+			Conditions: []routeCondition{
+				{Field: "header:X-Original-From", Regex: regexp.MustCompile(`^managers@nagoya-u\.ac\.jp$`)},
+			},
+			Target: "B",
+		},
+		{
+			Conditions: []routeCondition{
+				{Field: "from", Regex: regexp.MustCompile(`^managers@nagoya-u\.ac\.jp$`)},
+			},
+			Target: "B",
+		},
+	}
+
+	// メーリングリスト経由でFromが書き換わっているケース（X-Original-Fromで判定）
+	viaML := messageHeader{
+		From: "staff-sender@coop.nagoya-u.ac.jp",
+		Header: textproto.MIMEHeader{
+			"X-Original-From": []string{"managers@nagoya-u.ac.jp"},
+		},
+	}
+	if got := resolveTarget(routes, viaML); got != "B" {
+		t.Fatalf("resolveTarget() via mailing list = %q, want %q", got, "B")
+	}
+
+	// 直接送信されており，X-Original-Fromが存在しないケース（fromで判定）
+	direct := messageHeader{From: "managers@nagoya-u.ac.jp", Header: textproto.MIMEHeader{}}
+	if got := resolveTarget(routes, direct); got != "B" {
+		t.Fatalf("resolveTarget() direct = %q, want %q", got, "B")
+	}
+}
+
+func TestLoadDiscordRoutesHeaderField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "routes.txt")
+	content := "header:X-Original-From:^managers@nagoya-u\\.ac\\.jp$\tB\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatalf("write route file: %v", err)
+	}
+	routes, err := loadDiscordRoutes(path)
+	if err != nil {
+		t.Fatalf("loadDiscordRoutes() error = %v", err)
+	}
+	if len(routes) != 1 || routes[0].Conditions[0].Field != "header:X-Original-From" {
+		t.Fatalf("routes = %+v, want header:X-Original-From condition", routes)
+	}
+
+	emptyHeaderPath := filepath.Join(dir, "empty_header.txt")
+	if err := os.WriteFile(emptyHeaderPath, []byte("header:\tB\n"), 0600); err != nil {
+		t.Fatalf("write route file: %v", err)
+	}
+	if _, err := loadDiscordRoutes(emptyHeaderPath); err == nil {
+		t.Fatal("loadDiscordRoutes() with empty header name expected error, got nil")
 	}
 }

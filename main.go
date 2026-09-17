@@ -57,6 +57,11 @@ type messageHeader struct {
 	From      string
 	Recipient string
 	Body      string
+	// Header は，メールの全ヘッダーを保持する．メーリングリストソフト（fml等）を
+	// 経由するとFromが書き換わり，元の送信元アドレスがX-Original-Fromなど別の
+	// ヘッダーに残るケースがあるため，ルーティング条件で任意のヘッダーを
+	// 参照できるようにしている．
+	Header textproto.MIMEHeader
 }
 
 var emailTokenRE = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
@@ -287,6 +292,13 @@ func pollOnce(cfg config, filters []*regexp.Regexp, routes []discordRoute, st *s
 // routeFieldValue は，msgからroute conditionのfieldに対応する文字列を取り出す．
 // "text"は件名と本文を改行で結合したものを表す．
 func routeFieldValue(field string, msg messageHeader) (string, bool) {
+	if headerName, ok := strings.CutPrefix(field, "header:"); ok {
+		if headerName == "" {
+			return "", false
+		}
+		return msg.Header.Get(headerName), true
+	}
+
 	switch field {
 	case "from":
 		return msg.From, true
@@ -408,6 +420,7 @@ func parseMessageHeader(path string) (messageHeader, error) {
 		From:      from,
 		Recipient: recipientHeaders(header),
 		Body:      string(bodyBytes),
+		Header:    header,
 	}, nil
 }
 
@@ -555,15 +568,30 @@ func loadDiscordRoutes(path string) ([]discordRoute, error) {
 			negate := strings.HasPrefix(raw, "!")
 			raw = strings.TrimPrefix(raw, "!")
 
-			field, pattern, ok := strings.Cut(raw, ":")
-			if !ok {
-				return nil, fmt.Errorf("parse discord route %s:%d: expected \"field:regex\"", path, lineNo)
-			}
-			field = strings.TrimSpace(field)
-			switch field {
-			case "from", "subject", "body", "text":
-			default:
-				return nil, fmt.Errorf("parse discord route %s:%d: unknown field %q (want from, subject, body, or text)", path, lineNo, field)
+			// "header:<ヘッダー名>:regex" は，ヘッダー名自体にコロンを含まない
+			// 前提で，2番目のコロンをfieldとregexの区切りとして扱う．
+			// それ以外（from/subject/body/text）は，最初のコロンで区切る．
+			var field, pattern string
+			if rest, isHeader := strings.CutPrefix(raw, "header:"); isHeader {
+				headerName, p, ok := strings.Cut(rest, ":")
+				if !ok || strings.TrimSpace(headerName) == "" {
+					return nil, fmt.Errorf("parse discord route %s:%d: expected \"header:<name>:regex\"", path, lineNo)
+				}
+				field = "header:" + strings.TrimSpace(headerName)
+				pattern = p
+			} else {
+				f, p, ok := strings.Cut(raw, ":")
+				if !ok {
+					return nil, fmt.Errorf("parse discord route %s:%d: expected \"field:regex\"", path, lineNo)
+				}
+				f = strings.TrimSpace(f)
+				switch f {
+				case "from", "subject", "body", "text":
+				default:
+					return nil, fmt.Errorf("parse discord route %s:%d: unknown field %q (want from, subject, body, text, or header:<name>)", path, lineNo, f)
+				}
+				field = f
+				pattern = p
 			}
 
 			regex, err := regexp.Compile(pattern)
