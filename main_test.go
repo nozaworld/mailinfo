@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net/textproto"
 	"os"
 	"path/filepath"
@@ -307,5 +308,41 @@ func TestLoadDiscordRoutesHeaderField(t *testing.T) {
 	}
 	if _, err := loadDiscordRoutes(emptyHeaderPath); err == nil {
 		t.Fatal("loadDiscordRoutes() with empty header name expected error, got nil")
+	}
+}
+
+func TestCharsetReaderPassesThroughUTF8(t *testing.T) {
+	r, err := charsetReader("utf-8", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("charsetReader() error = %v", err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("got %q, want %q", got, "hello")
+	}
+}
+
+func TestParseMessageHeaderDecodesISO2022JPSubject(t *testing.T) {
+	// staffメーリングリストで実際に文字化けが発生した件名（ISO-2022-JPの
+	// encoded-wordが2つ連続する形式）を，iconv経由のcharsetReaderで
+	// 正しくデコードできることを確認する．golang.org/x/textには依存しない．
+	dir := t.TempDir()
+	path := filepath.Join(dir, "iso2022jp.eml")
+	content := "Subject: [Staff:43423] =?ISO-2022-JP?B?GyRCOTk/N0RMQ04bKEI=?= - =?ISO-2022-JP?B?GyRCTD5CZ0A4NihDPEt2NElNfSU3JTklRiVgGyhC?=\r\n\r\nbody\r\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatalf("write eml: %v", err)
+	}
+
+	msg, err := parseMessageHeader(path)
+	if err != nil {
+		t.Fatalf("parseMessageHeader() error = %v", err)
+	}
+
+	want := "[Staff:43423] 更新通知 - 名大生協端末管理システム"
+	if msg.Subject != want {
+		t.Fatalf("Subject = %q, want %q", msg.Subject, want)
 	}
 }

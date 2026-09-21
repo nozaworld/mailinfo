@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/textproto"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -385,6 +386,40 @@ func scanMaildir(maildirPath string) ([]messageHeader, error) {
 	return messages, nil
 }
 
+// subjectDecoder は，件名（Subject）のRFC 2047エンコード（encoded-word）を
+// デコードするために使う．ISO-2022-JPやShift_JISなど，Goの標準ライブラリが
+// 扱わない文字エンコーディングは，charsetReaderがiconvコマンドへ委譲して
+// UTF-8へ変換する（golang.org/x/textに依存しない）．
+var subjectDecoder = &mime.WordDecoder{CharsetReader: charsetReader}
+
+// charsetReader は，mime.WordDecoderから，encoded-word内の文字エンコーディング名
+// （例: "iso-2022-jp"，"shift_jis"）とその生バイト列を受け取り，UTF-8へ変換した
+// io.Readerを返す．UTF-8・US-ASCIIはそのまま返し，それ以外はiconvコマンドへ
+// パイプしてUTF-8へ変換する．iconvはLinuxに標準で入っているため，追加の
+// 依存ライブラリを必要としない．
+func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "", "us-ascii", "ascii", "utf-8", "utf8":
+		return input, nil
+	}
+
+	data, err := io.ReadAll(input)
+	if err != nil {
+		return nil, fmt.Errorf("read charset %s input: %w", charset, err)
+	}
+
+	cmd := exec.Command("iconv", "-f", charset, "-t", "UTF-8//TRANSLIT")
+	cmd.Stdin = bytes.NewReader(data)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("iconv -f %s: %w: %s", charset, err, strings.TrimSpace(stderr.String()))
+	}
+	return &out, nil
+}
+
 func parseMessageHeader(path string) (messageHeader, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -403,7 +438,7 @@ func parseMessageHeader(path string) (messageHeader, error) {
 		from = address.Address
 	}
 
-	subject, err := new(mime.WordDecoder).DecodeHeader(header.Get("Subject"))
+	subject, err := subjectDecoder.DecodeHeader(header.Get("Subject"))
 	if err != nil {
 		subject = header.Get("Subject")
 	}
