@@ -20,6 +20,7 @@
 - 平日および業務時間帯による通知制限
 - 通知済みメールキーのJSONファイル管理
 - 件名内メールアドレスのサニタイズ
+- 件名のMIMEデコード（RFC 2047のencoded-word）．ISO-2022-JPやShift_JISなど，Go標準ライブラリが扱わない文字コードは`iconv`コマンド経由でUTF-8へ変換
 - 差出人・件名・本文の条件によるDiscord通知先の振り分け（送信スキップを含む）
 - Discord Webhookへの新着メール件名の通知
 
@@ -38,6 +39,7 @@
 - 読み取り可能なMaildir
 - 状態ファイルを書き込めるディレクトリ
 - 通知先のDiscord Webhook URL
+- `iconv`コマンド（ISO-2022-JPやShift_JISなど，UTF-8以外の文字コードで書かれた件名をデコードする場合に必要．多くのLinuxディストリビューションに標準で含まれる）
 
 ## 使い方
 
@@ -175,28 +177,36 @@ DISCORD_DEFAULT_TARGET="D"
 
 `DISCORD_ROUTE_FILE`には，1行につき1ルールを記述します．タブ区切りで複数の条件を並べ，最後の要素をtargetとします．同じ行内の条件はすべてを満たした場合にのみマッチします（AND）．条件は`field:regex`（一致すればマッチ）または`!field:regex`（一致しなければマッチ）の形式で指定し，`field`には`from`（差出人），`subject`（件名），`body`（本文，MIMEデコード前の生テキスト），`text`（件名と本文を結合したもの），`header:<ヘッダー名>`（任意のメールヘッダーの値）を指定できます．ルールは上から順に評価し，最初にマッチした行のtargetを採用します．targetに`skip`を指定すると，そのメールはどのDiscord Webhookへも通知しません．どの行にもマッチしない場合は，`DISCORD_DEFAULT_TARGET`に対応するURLへ通知します．target名に対応するURLが`DISCORD_WEBHOOK_URLS`に見つからない場合は，通知をスキップします．target名は`DISCORD_WEBHOOK_URLS`のキー名と1文字も違わず一致させる必要があります．
 
-`header:<ヘッダー名>`は，`sympa`や`fml`などのメーリングリストソフトを経由すると`From`が配信用アドレスに書き換えられ，元の送信元アドレスが`X-Original-From`など別のヘッダーに残るケースに対応するためのものです．`header:X-Original-From:^managers@nagoya-u\.ac\.jp$`のように指定すると，該当ヘッダーの値（`textproto.MIMEHeader.Get`と同様，ヘッダー名の大文字小文字は区別しません）に対して正規表現マッチを行います．
+`header:<ヘッダー名>`は，`sympa`や`fml`などのメーリングリストソフトを経由すると`From`が配信用アドレスに書き換えられ，元の送信元アドレスが`X-Original-From`など別のヘッダーに残るケースに対応するためのものです．`header:X-Original-From:^managers@example\.com$`のように指定すると，該当ヘッダーの値（`textproto.MIMEHeader.Get`と同様，ヘッダー名の大文字小文字は区別しません）に対して正規表現マッチを行います．
 
-次の例は，学内（`.nagoya-u.ac.jp`）・生協（`coop.`）ドメイン以外の差出人を通知対象から除外し，差出人ごと・キーワードごとにDiscordの通知先を振り分けます（`private/discord_routes.txt`の実際の内容）．メーリングリスト経由で`From`が書き換わる場合に備えて，`header:X-Original-From`による判定と，直接送信された場合の`from`による判定の両方を用意しています．
+次の例は，架空のドメイン・アドレスを用いた設定イメージです．自組織のメールドメイン（`example.com`）およびメーリングリスト中継ドメイン（`list.example.com`）以外の差出人を通知対象から除外し，差出人ごと・キーワードごとにDiscordの通知先を振り分けます．メーリングリスト経由で`From`が書き換わる場合に備えて，`header:X-Original-From`による判定と，直接送信された場合の`from`による判定の両方を用意しています．
 
 ```text
 # field:regex[<TAB>field:regex...]<TAB>target
-!from:@(?:[^@]*\.)?nagoya-u\.ac\.jp$	!from:@coop\.	skip
 
-header:X-Original-From:^managers@nagoya-u\.ac\.jp$	B
-from:^managers@nagoya-u\.ac\.jp$	B
+# メールゲートウェイがspamと判定したメールは，送信元ドメインを詐称していても通知しない
+header:X-KSMG-AntiSpam-Status:^spam$	skip
 
-header:X-Original-From:^nagios@.*coop\.nagoya-u\.ac\.jp$	C
-from:^nagios@.*coop\.nagoya-u\.ac\.jp$	C
+!from:@(?:[^@]*\.)?example\.com$	!from:@list\.	skip
+
+header:X-Original-From:^managers@example\.com$	B
+from:^managers@example\.com$	B
+
+header:X-Original-From:^nagios@.*list\.example\.com$	C
+from:^nagios@.*list\.example\.com$	C
 header:X-Original-From:^staff@	C
 from:^staff@	C
-header:X-Original-From:^ipdb-admin@icts\.nagoya-u\.ac\.jp$	C
-from:^ipdb-admin@icts\.nagoya-u\.ac\.jp$	C
+header:X-Original-From:^ipdb-admin@example\.com$	C
+from:^ipdb-admin@example\.com$	C
 
 text:(お願い|トラブル|していただ)	A
 ```
 
 ブラックリストによる除外は，既存の`EXCLUDE_FILE`（送信元除外ファイル）で判定されるため，このファイルには含めていません．空行と`#`で始まる行は無視されます．
+
+### 件名の文字コード（MIMEデコード）
+
+件名がRFC 2047のencoded-word（`=?charset?B?...?=`など）でエンコードされている場合，UTF-8とUS-ASCIIはGo標準ライブラリでデコードします．ISO-2022-JPやShift_JISなど，それ以外の文字コードは`golang.org/x/text`に頼らず，`iconv`コマンドへ生バイト列をパイプしてUTF-8へ変換します．そのため，動作環境に`iconv`コマンドが必要です．`iconv`が使えない，または対象の文字コードを変換できない場合，件名はデコードされずヘッダーの生の値（`=?ISO-2022-JP?B?...?=`のような文字列）のままDiscordへ通知されます．
 
 ## テスト
 

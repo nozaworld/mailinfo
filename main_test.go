@@ -118,20 +118,20 @@ func TestResolveTarget(t *testing.T) {
 		},
 		{
 			Conditions: []routeCondition{
-				{Field: "from", Regex: regexp.MustCompile(`@(?:[^@]*\.)?nagoya-u\.ac\.jp$`), Negate: true},
-				{Field: "from", Regex: regexp.MustCompile(`@coop\.`), Negate: true},
+				{Field: "from", Regex: regexp.MustCompile(`@(?:[^@]*\.)?example\.com$`), Negate: true},
+				{Field: "from", Regex: regexp.MustCompile(`@list\.`), Negate: true},
 			},
 			Target: skipTarget,
 		},
 		{
 			Conditions: []routeCondition{
-				{Field: "from", Regex: regexp.MustCompile(`^managers@nagoya-u\.ac\.jp$`)},
+				{Field: "from", Regex: regexp.MustCompile(`^managers@example\.com$`)},
 			},
 			Target: "security-info",
 		},
 		{
 			Conditions: []routeCondition{
-				{Field: "from", Regex: regexp.MustCompile(`^nagios@.*coop\.nagoya-u\.ac\.jp$`)},
+				{Field: "from", Regex: regexp.MustCompile(`^nagios@.*list\.example\.com$`)},
 			},
 			Target: "mail-alert",
 		},
@@ -166,27 +166,27 @@ func TestResolveTarget(t *testing.T) {
 		},
 		{
 			name: "coop subdomain is not skipped",
-			msg:  messageHeader{From: "nagios@monitor.coop.nagoya-u.ac.jp", Subject: "HOST DOWN", Body: ""},
+			msg:  messageHeader{From: "nagios@monitor.list.example.com", Subject: "HOST DOWN", Body: ""},
 			want: "mail-alert",
 		},
 		{
 			name: "manager security info",
-			msg:  messageHeader{From: "managers@nagoya-u.ac.jp", Subject: "セキュリティアップデート", Body: ""},
+			msg:  messageHeader{From: "managers@example.com", Subject: "セキュリティアップデート", Body: ""},
 			want: "security-info",
 		},
 		{
 			name: "staff mail alert",
-			msg:  messageHeader{From: "staff@nagoya-u.ac.jp", Subject: "管理システム更新", Body: ""},
+			msg:  messageHeader{From: "staff@example.com", Subject: "管理システム更新", Body: ""},
 			want: "mail-alert",
 		},
 		{
 			name: "keyword based work log",
-			msg:  messageHeader{From: "kumagai@nagoya-u.ac.jp", Subject: "資料作成のお願い", Body: ""},
+			msg:  messageHeader{From: "tanaka@example.com", Subject: "資料作成のお願い", Body: ""},
 			want: "work-log",
 		},
 		{
 			name: "no rule matches",
-			msg:  messageHeader{From: "kumagai@nagoya-u.ac.jp", Subject: "共有です", Body: "資料を共有します"},
+			msg:  messageHeader{From: "tanaka@example.com", Subject: "共有です", Body: "資料を共有します"},
 			want: "",
 		},
 	}
@@ -205,8 +205,8 @@ func TestLoadDiscordRoutes(t *testing.T) {
 		"# comment line",
 		"",
 		"from:@blocked\\.example\tskip",
-		"!from:\\.nagoya-u\\.ac\\.jp$\t!from:@coop\\.\tskip",
-		"from:^managers@nagoya-u\\.ac\\.jp$\tsecurity-info",
+		"!from:\\.example\\.com$\t!from:@list\\.\tskip",
+		"from:^managers@example\\.com$\tsecurity-info",
 		"text:(お願い|トラブル|していただ)\twork-log",
 	}
 	content := strings.Join(lines, "\n") + "\n"
@@ -233,14 +233,14 @@ func TestLoadDiscordRoutes(t *testing.T) {
 
 func TestRouteFieldValueHeader(t *testing.T) {
 	msg := messageHeader{
-		From: "staff-sender@coop.nagoya-u.ac.jp",
+		From: "staff-sender@list.example.com",
 		Header: textproto.MIMEHeader{
-			"X-Original-From": []string{"managers@nagoya-u.ac.jp"},
+			"X-Original-From": []string{"managers@example.com"},
 		},
 	}
 	value, ok := routeFieldValue("header:X-Original-From", msg)
-	if !ok || value != "managers@nagoya-u.ac.jp" {
-		t.Fatalf("routeFieldValue() = %q, %v, want %q, true", value, ok, "managers@nagoya-u.ac.jp")
+	if !ok || value != "managers@example.com" {
+		t.Fatalf("routeFieldValue() = %q, %v, want %q, true", value, ok, "managers@example.com")
 	}
 
 	if _, ok := routeFieldValue("header:", msg); ok {
@@ -257,13 +257,13 @@ func TestResolveTargetWithHeaderFallback(t *testing.T) {
 	routes := []discordRoute{
 		{
 			Conditions: []routeCondition{
-				{Field: "header:X-Original-From", Regex: regexp.MustCompile(`^managers@nagoya-u\.ac\.jp$`)},
+				{Field: "header:X-Original-From", Regex: regexp.MustCompile(`^managers@example\.com$`)},
 			},
 			Target: "B",
 		},
 		{
 			Conditions: []routeCondition{
-				{Field: "from", Regex: regexp.MustCompile(`^managers@nagoya-u\.ac\.jp$`)},
+				{Field: "from", Regex: regexp.MustCompile(`^managers@example\.com$`)},
 			},
 			Target: "B",
 		},
@@ -271,9 +271,9 @@ func TestResolveTargetWithHeaderFallback(t *testing.T) {
 
 	// メーリングリスト経由でFromが書き換わっているケース（X-Original-Fromで判定）
 	viaML := messageHeader{
-		From: "staff-sender@coop.nagoya-u.ac.jp",
+		From: "staff-sender@list.example.com",
 		Header: textproto.MIMEHeader{
-			"X-Original-From": []string{"managers@nagoya-u.ac.jp"},
+			"X-Original-From": []string{"managers@example.com"},
 		},
 	}
 	if got := resolveTarget(routes, viaML); got != "B" {
@@ -281,7 +281,7 @@ func TestResolveTargetWithHeaderFallback(t *testing.T) {
 	}
 
 	// 直接送信されており，X-Original-Fromが存在しないケース（fromで判定）
-	direct := messageHeader{From: "managers@nagoya-u.ac.jp", Header: textproto.MIMEHeader{}}
+	direct := messageHeader{From: "managers@example.com", Header: textproto.MIMEHeader{}}
 	if got := resolveTarget(routes, direct); got != "B" {
 		t.Fatalf("resolveTarget() direct = %q, want %q", got, "B")
 	}
@@ -290,7 +290,7 @@ func TestResolveTargetWithHeaderFallback(t *testing.T) {
 func TestLoadDiscordRoutesHeaderField(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "routes.txt")
-	content := "header:X-Original-From:^managers@nagoya-u\\.ac\\.jp$\tB\n"
+	content := "header:X-Original-From:^managers@example\\.com$\tB\n"
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatalf("write route file: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestParseMessageHeaderDecodesISO2022JPSubject(t *testing.T) {
 	// 正しくデコードできることを確認する．golang.org/x/textには依存しない．
 	dir := t.TempDir()
 	path := filepath.Join(dir, "iso2022jp.eml")
-	content := "Subject: [Staff:43423] =?ISO-2022-JP?B?GyRCOTk/N0RMQ04bKEI=?= - =?ISO-2022-JP?B?GyRCTD5CZ0A4NihDPEt2NElNfSU3JTklRiVgGyhC?=\r\n\r\nbody\r\n"
+	content := "Subject: [Staff:43423] =?ISO-2022-JP?B?GyRCOTk/N0RMQ04bKEI=?= - =?ISO-2022-JP?B?GyRCJTclOSVGJWA0SU19PDwbKEI=?=\r\n\r\nbody\r\n"
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatalf("write eml: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestParseMessageHeaderDecodesISO2022JPSubject(t *testing.T) {
 		t.Fatalf("parseMessageHeader() error = %v", err)
 	}
 
-	want := "[Staff:43423] 更新通知 - 名大生協端末管理システム"
+	want := "[Staff:43423] 更新通知 - システム管理室"
 	if msg.Subject != want {
 		t.Fatalf("Subject = %q, want %q", msg.Subject, want)
 	}
