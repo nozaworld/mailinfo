@@ -9,8 +9,10 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/mail"
+	"net/smtp"
 	"net/textproto"
 	"os"
 	"os/exec"
@@ -24,13 +26,34 @@ import (
 
 type config struct {
 	// DiscordWebhookURLs は，通知先の名前（target）とDiscord Webhook URLの対応表．
-	// "default"は，DiscordRouteFileのどのルールにもマッチしなかった場合に使う
-	// 既定の通知先名（DiscordDefaultTargetで変更可能）．
+	// "default"は，RouteFileのどのルールにもマッチしなかった場合に使う
+	// 既定の通知先名（DefaultTargetで変更可能）．
 	DiscordWebhookURLs map[string]string
-	DiscordRouteFile   string
-	// DiscordDefaultTarget は，ルールにマッチしなかった場合に使う
-	// DiscordWebhookURLsのキー名．
-	DiscordDefaultTarget string
+	// SlackWebhookURLs は，target名とSlack Incoming Webhook URLの対応表．
+	SlackWebhookURLs map[string]string
+	// WebhookURLs は，target名と汎用Webhook URLの対応表．MailEventをJSONへ
+	// エンコードしたものをそのままPOSTするため，Discord/Slack以外の任意の
+	// システムと連携できる．
+	WebhookURLs map[string]string
+	// LogTargets は，target名とログファイルの出力先パスの対応表．
+	LogTargets map[string]string
+	// DesktopTargets は，デスクトップ通知（notify-send）を使うtarget名の一覧．
+	// URLやパスなど付随する値を必要としないため，他のtargetと異なり文字列の
+	// スライスで保持する．
+	DesktopTargets []string
+	// EmailTargets は，target名と通知先メールアドレスの対応表．送信に使う
+	// SMTPサーバーの設定はSMTPHost以下の項目で共通のものを使う．
+	EmailTargets map[string]string
+	SMTPHost     string
+	SMTPPort     string
+	SMTPUser     string
+	SMTPPass     string
+	SMTPFrom     string
+
+	RouteFile string
+	// DefaultTarget は，RouteFileのどのルールにもマッチしなかった場合に使う
+	// target名．
+	DefaultTarget string
 
 	MaildirPath  string
 	StaffAddress string
@@ -43,7 +66,7 @@ type config struct {
 	RequireStaff bool
 }
 
-// skipTarget は，DiscordRouteFile内のルールで使う予約されたtarget名．
+// skipTarget は，RouteFile内のルールで使う予約されたtarget名．
 // このtargetにマッチしたメールは，どのDiscord Webhookへも通知せずスキップする．
 const skipTarget = "skip"
 
@@ -77,11 +100,30 @@ type routeCondition struct {
 	Negate bool
 }
 
-// discordRoute は，複数のroute condition（すべて満たした場合にマッチ，AND条件）と，
-// マッチした場合の通知先target名（DiscordWebhookURLsのキー，またはskipTarget）を表す．
-type discordRoute struct {
+// route は，複数のroute condition（すべて満たした場合にマッチ，AND条件）と，
+// マッチした場合の通知先target名（buildNotifiersに登録したキー，または
+// skipTarget）を表す．通知先の種類（Discord，Slack等）によらず共通で使う．
+type route struct {
 	Conditions []routeCondition
 	Target     string
+}
+
+// MailEvent は，通知対象となった1件のメールに関する情報をまとめたもの．
+// 「Maildir監視 → メールイベント → 通知先プラグイン」という構造の，
+// 監視処理と通知先プラグインの間を受け渡すデータであり，Maildir走査や
+// メールヘッダー解析の詳細（生ヘッダーや本文全体など）はここには含めず，
+// 通知先プラグインが実際に必要とする項目だけを渡す．
+type MailEvent struct {
+	// Key は，メールを一意に識別するキー（Maildirファイル名由来）．
+	Key string `json:"key"`
+	// Subject は，sanitizeSubjectを通した後の件名．
+	Subject string `json:"subject"`
+	// From は，差出人アドレス．
+	From string `json:"from"`
+	// Target は，ルーティングでマッチした通知先target名．
+	Target string `json:"target"`
+	// Time は，通知処理を行った時刻．
+	Time time.Time `json:"time"`
 }
 
 func main() {
@@ -95,7 +137,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	routes, err := loadDiscordRoutes(cfg.DiscordRouteFile)
+	routes, err := loadRoutes(cfg.RouteFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -122,15 +164,251 @@ func main() {
 		log.Printf("initialized state with %d existing messages", len(st.Seen))
 	}
 
+	notifiers, err := buildNotifiers(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
 
 	for {
-		if err := pollOnce(cfg, filters, routes, &st); err != nil {
+		if err := pollOnce(cfg, filters, routes, notifiers, &st); err != nil {
 			log.Printf("poll failed: %v", err)
 		}
 		<-ticker.C
 	}
+}
+
+// Notifier は，マッチしたメールイベントを外部へ知らせる手段を表す．
+// 「Maildir監視 → メールイベント → 通知先プラグイン」という構造にしておくことで，
+// Discord以外の通知先（Slack，汎用Webhook，メール，ログ，デスクトップ通知など）を
+// 追加する場合も，この interface を満たす実装をtarget名に登録するだけでよく，
+// pollOnceやルーティングのロジックには手を入れる必要がない．
+type Notifier interface {
+	// Notify は，1件のメールイベントを，この通知先へ送る．
+	Notify(event MailEvent) error
+}
+
+// postJSON は，payloadをJSONへエンコードしてurlへPOSTする共通処理．
+// Discord・Slack・汎用Webhookの3つのNotifier実装がこれを利用する．
+func postJSON(url string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode payload: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("status %s: %s", resp.Status, strings.TrimSpace(string(responseBody)))
+	}
+	return nil
+}
+
+// discordNotifier は，Discord WebhookへPOSTするNotifierの実装．
+type discordNotifier struct {
+	webhookURL string
+}
+
+func (n *discordNotifier) Notify(event MailEvent) error {
+	if err := postJSON(n.webhookURL, map[string]string{"content": event.Subject}); err != nil {
+		return fmt.Errorf("discord: %w", err)
+	}
+	return nil
+}
+
+// slackNotifier は，Slack Incoming WebhookへPOSTするNotifierの実装．
+type slackNotifier struct {
+	webhookURL string
+}
+
+func (n *slackNotifier) Notify(event MailEvent) error {
+	if err := postJSON(n.webhookURL, map[string]string{"text": event.Subject}); err != nil {
+		return fmt.Errorf("slack: %w", err)
+	}
+	return nil
+}
+
+// webhookNotifier は，任意のURLへMailEventをJSONのままPOSTするNotifierの実装．
+// Discord・Slack向けの固定フォーマットに合わせられない通知先（自作の受信側や
+// 他のチャットツールなど）向けに，メールイベントの内容をそのまま渡す．
+type webhookNotifier struct {
+	url string
+}
+
+func (n *webhookNotifier) Notify(event MailEvent) error {
+	if err := postJSON(n.url, event); err != nil {
+		return fmt.Errorf("webhook: %w", err)
+	}
+	return nil
+}
+
+// logLine は，logNotifierがログファイルへ追記する1行分の文字列を作る．
+// タブ区切りで時刻・target・差出人・件名を並べる，単純なテキスト形式．
+func logLine(event MailEvent) string {
+	return fmt.Sprintf("%s\t%s\t%s\t%s\n", event.Time.Format(time.RFC3339), event.Target, event.From, event.Subject)
+}
+
+// logNotifier は，メールイベントをログファイルへ追記するNotifierの実装．
+// 常駐プログラム自体の標準ログ（log.Printf）とは別に，通知内容だけを機械
+// 可読な形で残しておきたい場合（他のログ収集基盤で監視する場合など）に使う．
+type logNotifier struct {
+	path string
+}
+
+func (n *logNotifier) Notify(event MailEvent) error {
+	if err := os.MkdirAll(parentDir(n.path), 0700); err != nil {
+		return fmt.Errorf("log: create dir: %w", err)
+	}
+	file, err := os.OpenFile(n.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("log: open file: %w", err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString(logLine(event)); err != nil {
+		return fmt.Errorf("log: write file: %w", err)
+	}
+	return nil
+}
+
+// notifySendArgs は，desktopNotifierがnotify-sendコマンドへ渡す引数を組み立てる．
+// titleが空の場合は既定のタイトルを使う．
+func notifySendArgs(title string, event MailEvent) []string {
+	if title == "" {
+		title = "mailinfo"
+	}
+	return []string{title, event.Subject}
+}
+
+// desktopNotifier は，freedesktop仕様のnotify-sendコマンド経由でデスクトップ
+// 通知を表示するNotifierの実装．iconvと同様に外部コマンドをexec.Commandで
+// 呼び出すだけなので，golang.org/x以下の追加ライブラリには依存しない．
+// GUIを持たないサーバー上で常駐させる運用では，notify-sendが存在しない，
+// またはDBUSに接続できないため失敗する点に注意する．
+type desktopNotifier struct {
+	title string
+}
+
+func (n *desktopNotifier) Notify(event MailEvent) error {
+	args := notifySendArgs(n.title, event)
+	cmd := exec.Command("notify-send", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("desktop: notify-send: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// buildEmailMessage は，emailNotifierがnet/smtpへ渡す，ヘッダー付きのメール
+// 本文（RFC 5322形式）を組み立てる．件名はASCII以外の文字を含み得るため，
+// mime.QEncoding（RFC 2047）でエンコードする．
+func buildEmailMessage(from, to string, event MailEvent) []byte {
+	subject := mime.QEncoding.Encode("UTF-8", "[mailinfo] "+event.Subject)
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "From: %s\r\n", from)
+	fmt.Fprintf(&buf, "To: %s\r\n", to)
+	fmt.Fprintf(&buf, "Subject: %s\r\n", subject)
+	fmt.Fprintf(&buf, "Date: %s\r\n", event.Time.Format(time.RFC1123Z))
+	buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	buf.WriteString("\r\n")
+	fmt.Fprintf(&buf, "差出人: %s\r\n通知先: %s\r\n件名: %s\r\n", event.From, event.Target, event.Subject)
+	return buf.Bytes()
+}
+
+// emailNotifier は，SMTP経由でメールを送るNotifierの実装．SMTPサーバーの
+// 接続情報はtarget間で共通（config.SMTPHost以下）とし，宛先アドレスだけを
+// target毎に変える．
+type emailNotifier struct {
+	host, port, user, pass, from, to string
+}
+
+func (n *emailNotifier) Notify(event MailEvent) error {
+	addr := net.JoinHostPort(n.host, n.port)
+	var auth smtp.Auth
+	if n.user != "" {
+		auth = smtp.PlainAuth("", n.user, n.pass, n.host)
+	}
+	msg := buildEmailMessage(n.from, n.to, event)
+	if err := smtp.SendMail(addr, auth, n.from, []string{n.to}, msg); err != nil {
+		return fmt.Errorf("email: %w", err)
+	}
+	return nil
+}
+
+// buildNotifiers は，config内の各種通知先設定（Discord，Slack，汎用Webhook，
+// ログ，デスクトップ通知，メール）を，target名とNotifierの対応表へまとめる．
+// 「Maildir監視 → メールイベント → 通知先プラグイン」という構造にしているため，
+// 新しい通知先を追加する場合も，ここに同様のfor文を1つ足して戻り値のmapへ
+// 登録するだけでよく，pollOnceやルーティングのロジックには手を入れる必要が
+// ない．同じtarget名が複数の種類の通知先に定義された場合はエラーとする．
+func buildNotifiers(cfg config) (map[string]Notifier, error) {
+	notifiers := make(map[string]Notifier)
+	kinds := make(map[string]string)
+
+	add := func(kind, target string, notifier Notifier) error {
+		if prevKind, exists := kinds[target]; exists {
+			return fmt.Errorf("target %q is defined by both %s and %s notifiers; each target must map to exactly one notifier", target, prevKind, kind)
+		}
+		kinds[target] = kind
+		notifiers[target] = notifier
+		return nil
+	}
+
+	for target, url := range cfg.DiscordWebhookURLs {
+		if err := add("discord", target, &discordNotifier{webhookURL: url}); err != nil {
+			return nil, err
+		}
+	}
+	for target, url := range cfg.SlackWebhookURLs {
+		if err := add("slack", target, &slackNotifier{webhookURL: url}); err != nil {
+			return nil, err
+		}
+	}
+	for target, url := range cfg.WebhookURLs {
+		if err := add("webhook", target, &webhookNotifier{url: url}); err != nil {
+			return nil, err
+		}
+	}
+	for target, path := range cfg.LogTargets {
+		if err := add("log", target, &logNotifier{path: path}); err != nil {
+			return nil, err
+		}
+	}
+	for _, target := range cfg.DesktopTargets {
+		if err := add("desktop", target, &desktopNotifier{title: "mailinfo"}); err != nil {
+			return nil, err
+		}
+	}
+	for target, to := range cfg.EmailTargets {
+		notifier := &emailNotifier{
+			host: cfg.SMTPHost,
+			port: cfg.SMTPPort,
+			user: cfg.SMTPUser,
+			pass: cfg.SMTPPass,
+			from: cfg.SMTPFrom,
+			to:   to,
+		}
+		if err := add("email", target, notifier); err != nil {
+			return nil, err
+		}
+	}
+
+	return notifiers, nil
 }
 
 func loadConfig() (config, error) {
@@ -157,9 +435,9 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("WORK_START_HOUR and WORK_END_HOUR must satisfy 0 <= start < end <= 24")
 	}
 
-	webhookURLs, err := parseWebhookURLs(os.Getenv("DISCORD_WEBHOOK_URLS"))
+	webhookURLs, err := parseNamedValues(os.Getenv("DISCORD_WEBHOOK_URLS"))
 	if err != nil {
-		return config{}, err
+		return config{}, fmt.Errorf("parse DISCORD_WEBHOOK_URLS: %w", err)
 	}
 	// DISCORD_WEBHOOK_URLは後方互換のため残しており，指定された場合は
 	// "default"という名前でwebhookURLsへ登録する（DISCORD_WEBHOOK_URLSで
@@ -173,30 +451,77 @@ func loadConfig() (config, error) {
 		}
 	}
 
+	slackWebhookURLs, err := parseNamedValues(os.Getenv("SLACK_WEBHOOK_URLS"))
+	if err != nil {
+		return config{}, fmt.Errorf("parse SLACK_WEBHOOK_URLS: %w", err)
+	}
+	genericWebhookURLs, err := parseNamedValues(os.Getenv("WEBHOOK_URLS"))
+	if err != nil {
+		return config{}, fmt.Errorf("parse WEBHOOK_URLS: %w", err)
+	}
+	logTargets, err := parseNamedValues(os.Getenv("LOG_TARGETS"))
+	if err != nil {
+		return config{}, fmt.Errorf("parse LOG_TARGETS: %w", err)
+	}
+	desktopTargets, err := parseNames(os.Getenv("DESKTOP_TARGETS"))
+	if err != nil {
+		return config{}, fmt.Errorf("parse DESKTOP_TARGETS: %w", err)
+	}
+	emailTargets, err := parseNamedValues(os.Getenv("EMAIL_TARGETS"))
+	if err != nil {
+		return config{}, fmt.Errorf("parse EMAIL_TARGETS: %w", err)
+	}
+
 	cfg := config{
-		DiscordWebhookURLs:   webhookURLs,
-		DiscordRouteFile:     getenvDefault("DISCORD_ROUTE_FILE", "private/discord_routes.txt"),
-		DiscordDefaultTarget: getenvDefault("DISCORD_DEFAULT_TARGET", "default"),
-		MaildirPath:          os.Getenv("MAILDIR_PATH"),
-		StaffAddress:         strings.ToLower(os.Getenv("STAFF_ADDRESS")),
-		StateFile:            getenvDefault("STATE_FILE", "private/state.json"),
-		ExcludeFile:          getenvDefault("EXCLUDE_FILE", "private/exclude_senders.txt"),
-		PollInterval:         pollInterval,
-		Location:             loc,
-		StartHour:            startHour,
-		EndHour:              endHour,
-		RequireStaff:         getenvBool("REQUIRE_STAFF_ADDRESS", true),
+		DiscordWebhookURLs: webhookURLs,
+		SlackWebhookURLs:   slackWebhookURLs,
+		WebhookURLs:        genericWebhookURLs,
+		LogTargets:         logTargets,
+		DesktopTargets:     desktopTargets,
+		EmailTargets:       emailTargets,
+		SMTPHost:           os.Getenv("SMTP_HOST"),
+		SMTPPort:           getenvDefault("SMTP_PORT", "587"),
+		SMTPUser:           os.Getenv("SMTP_USER"),
+		SMTPPass:           os.Getenv("SMTP_PASS"),
+		SMTPFrom:           os.Getenv("SMTP_FROM"),
+
+		RouteFile:     getenvDefault("DISCORD_ROUTE_FILE", "private/discord_routes.txt"),
+		DefaultTarget: getenvDefault("DISCORD_DEFAULT_TARGET", "default"),
+
+		MaildirPath:  os.Getenv("MAILDIR_PATH"),
+		StaffAddress: strings.ToLower(os.Getenv("STAFF_ADDRESS")),
+		StateFile:    getenvDefault("STATE_FILE", "private/state.json"),
+		ExcludeFile:  getenvDefault("EXCLUDE_FILE", "private/exclude_senders.txt"),
+		PollInterval: pollInterval,
+		Location:     loc,
+		StartHour:    startHour,
+		EndHour:      endHour,
+		RequireStaff: getenvBool("REQUIRE_STAFF_ADDRESS", true),
 	}
 
 	var missing []string
-	if len(cfg.DiscordWebhookURLs) == 0 {
-		missing = append(missing, "DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URLS")
+	hasNotifierConfig := len(cfg.DiscordWebhookURLs) > 0 ||
+		len(cfg.SlackWebhookURLs) > 0 ||
+		len(cfg.WebhookURLs) > 0 ||
+		len(cfg.LogTargets) > 0 ||
+		len(cfg.DesktopTargets) > 0 ||
+		len(cfg.EmailTargets) > 0
+	if !hasNotifierConfig {
+		missing = append(missing, "at least one of DISCORD_WEBHOOK_URL(S), SLACK_WEBHOOK_URLS, WEBHOOK_URLS, LOG_TARGETS, DESKTOP_TARGETS, EMAIL_TARGETS")
 	}
 	if cfg.MaildirPath == "" {
 		missing = append(missing, "MAILDIR_PATH")
 	}
 	if cfg.RequireStaff && cfg.StaffAddress == "" {
 		missing = append(missing, "STAFF_ADDRESS")
+	}
+	if len(cfg.EmailTargets) > 0 {
+		if cfg.SMTPHost == "" {
+			missing = append(missing, "SMTP_HOST")
+		}
+		if cfg.SMTPFrom == "" {
+			missing = append(missing, "SMTP_FROM")
+		}
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
@@ -206,35 +531,60 @@ func loadConfig() (config, error) {
 	return cfg, nil
 }
 
-// parseWebhookURLs は，DISCORD_WEBHOOK_URLSの値（"name1=url1,name2=url2"形式）を
-// target名とURLのマップへ変換する．空文字列の場合はnilを返す．
-func parseWebhookURLs(raw string) (map[string]string, error) {
+// parseNamedValues は，"name1=value1,name2=value2"形式の文字列を，target名と
+// 値（Webhook URL，ログファイルパス，メールアドレスなど）の対応表へ変換する．
+// Discord・Slack・汎用Webhook・ログ・メールなど，target名に1つの値が対応する
+// 通知先設定を読み込むための共通処理．空文字列を渡した場合はnilを返す．
+func parseNamedValues(raw string) (map[string]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
 	}
 
-	urls := map[string]string{}
+	values := map[string]string{}
 	for _, pair := range strings.Split(raw, ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
 			continue
 		}
-		name, url, ok := strings.Cut(pair, "=")
+		name, value, ok := strings.Cut(pair, "=")
 		name = strings.TrimSpace(name)
-		url = strings.TrimSpace(url)
-		if !ok || name == "" || url == "" {
-			return nil, fmt.Errorf("invalid DISCORD_WEBHOOK_URLS entry %q: want name=url", pair)
+		value = strings.TrimSpace(value)
+		if !ok || name == "" || value == "" {
+			return nil, fmt.Errorf("invalid entry %q: want name=value", pair)
 		}
 		if name == skipTarget {
-			return nil, fmt.Errorf("invalid DISCORD_WEBHOOK_URLS entry %q: %q is a reserved target name", pair, skipTarget)
+			return nil, fmt.Errorf("invalid entry %q: %q is a reserved target name", pair, skipTarget)
 		}
-		urls[name] = url
+		values[name] = value
 	}
-	return urls, nil
+	return values, nil
 }
 
-func pollOnce(cfg config, filters []*regexp.Regexp, routes []discordRoute, st *state) error {
+// parseNames は，カンマ区切りのtarget名リスト（例: "desk1,desk2"）を読み取る．
+// デスクトップ通知のように，URLやパスなど付随する値を持たない通知先の設定に使う．
+// 空文字列を渡した場合はnilを返す．
+func parseNames(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	var names []string
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if name == skipTarget {
+			return nil, fmt.Errorf("invalid target name %q: %q is a reserved target name", name, skipTarget)
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func pollOnce(cfg config, filters []*regexp.Regexp, routes []route, notifiers map[string]Notifier, st *state) error {
 	now := time.Now().In(cfg.Location)
 	if !withinWindow(now, cfg.StartHour, cfg.EndHour) {
 		return nil
@@ -264,21 +614,27 @@ func pollOnce(cfg config, filters []*regexp.Regexp, routes []discordRoute, st *s
 
 		target := resolveTarget(routes, msg)
 		if target == "" {
-			target = cfg.DiscordDefaultTarget
+			target = cfg.DefaultTarget
 		}
 		if target == skipTarget {
 			log.Printf("skip %s: routed to %q", msg.Key, skipTarget)
 			continue
 		}
 
-		webhookURL, ok := cfg.DiscordWebhookURLs[target]
-		if !ok || webhookURL == "" {
-			log.Printf("skip %s: no webhook URL registered for target %q", msg.Key, target)
+		notifier, ok := notifiers[target]
+		if !ok {
+			log.Printf("skip %s: no notifier registered for target %q", msg.Key, target)
 			continue
 		}
 
-		content := sanitizeSubject(msg.Subject)
-		if err := postDiscord(webhookURL, content); err != nil {
+		event := MailEvent{
+			Key:     msg.Key,
+			Subject: sanitizeSubject(msg.Subject),
+			From:    msg.From,
+			Target:  target,
+			Time:    now,
+		}
+		if err := notifier.Notify(event); err != nil {
 			return fmt.Errorf("notify %s: %w", msg.Key, err)
 		}
 		log.Printf("notified %s (target=%s)", msg.Key, target)
@@ -318,10 +674,10 @@ func routeFieldValue(field string, msg messageHeader) (string, bool) {
 // target名を返す．各ルールは，すべての条件（Conditions）を満たした場合にのみ
 // マッチする（AND）．Negateが指定された条件は，正規表現に一致しない場合にマッチする．
 // どのルールにもマッチしない場合は空文字列を返す．
-func resolveTarget(routes []discordRoute, msg messageHeader) string {
-	for _, route := range routes {
+func resolveTarget(routes []route, msg messageHeader) string {
+	for _, r := range routes {
 		matched := true
-		for _, cond := range route.Conditions {
+		for _, cond := range r.Conditions {
 			value, ok := routeFieldValue(cond.Field, msg)
 			if !ok {
 				matched = false
@@ -337,7 +693,7 @@ func resolveTarget(routes []discordRoute, msg messageHeader) string {
 			}
 		}
 		if matched {
-			return route.Target
+			return r.Target
 		}
 	}
 	return ""
@@ -555,25 +911,26 @@ func loadExcludeFilters(path string) ([]*regexp.Regexp, error) {
 	return filters, nil
 }
 
-// loadDiscordRoutes は，DiscordRouteFileからルーティングルールを読み込む．
-// 各行はタブ区切りで，最後の要素をtarget，それ以外の要素を条件として扱う．
-// 条件は"field:regex"（一致することが条件）または"!field:regex"（一致しないことが
-// 条件）の形式で指定し，1行内のすべての条件を満たした場合にのみマッチする（AND）．
-// fieldは"from"，"subject"，"body"，"text"（件名と本文の結合）のいずれか．
-// targetには，DISCORD_WEBHOOK_URLSで定義したtarget名，またはskipTarget（"skip"，
-// 通知をスキップする予約語）を指定する．
+// loadRoutes は，RouteFileからルーティングルールを読み込む．通知先の種類
+// （Discord，Slack，Webhookなど）によらず，target名を振り分けるための共通の
+// ルールファイルを扱う．各行はタブ区切りで，最後の要素をtarget，それ以外の
+// 要素を条件として扱う．条件は"field:regex"（一致することが条件）または
+// "!field:regex"（一致しないことが条件）の形式で指定し，1行内のすべての条件を
+// 満たした場合にのみマッチする（AND）．fieldは"from"，"subject"，"body"，
+// "text"（件名と本文の結合）のいずれか．targetには，buildNotifiersに登録した
+// target名，またはskipTarget（"skip"，通知をスキップする予約語）を指定する．
 // 空行と"#"で始まる行は無視する．ファイルが存在しない場合はルールなしとして扱う．
-func loadDiscordRoutes(path string) ([]discordRoute, error) {
+func loadRoutes(path string) ([]route, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("open discord route file: %w", err)
+		return nil, fmt.Errorf("open route file: %w", err)
 	}
 	defer file.Close()
 
-	var routes []discordRoute
+	var routes []route
 	scanner := bufio.NewScanner(file)
 	lineNo := 0
 	for scanner.Scan() {
@@ -585,12 +942,12 @@ func loadDiscordRoutes(path string) ([]discordRoute, error) {
 
 		fields := strings.Split(line, "\t")
 		if len(fields) < 2 {
-			return nil, fmt.Errorf("parse discord route %s:%d: expected \"field:regex<TAB>...<TAB>target\"", path, lineNo)
+			return nil, fmt.Errorf("parse route %s:%d: expected \"field:regex<TAB>...<TAB>target\"", path, lineNo)
 		}
 
 		target := strings.TrimSpace(fields[len(fields)-1])
 		if target == "" {
-			return nil, fmt.Errorf("parse discord route %s:%d: missing target", path, lineNo)
+			return nil, fmt.Errorf("parse route %s:%d: missing target", path, lineNo)
 		}
 
 		var conditions []routeCondition
@@ -610,20 +967,20 @@ func loadDiscordRoutes(path string) ([]discordRoute, error) {
 			if rest, isHeader := strings.CutPrefix(raw, "header:"); isHeader {
 				headerName, p, ok := strings.Cut(rest, ":")
 				if !ok || strings.TrimSpace(headerName) == "" {
-					return nil, fmt.Errorf("parse discord route %s:%d: expected \"header:<name>:regex\"", path, lineNo)
+					return nil, fmt.Errorf("parse route %s:%d: expected \"header:<name>:regex\"", path, lineNo)
 				}
 				field = "header:" + strings.TrimSpace(headerName)
 				pattern = p
 			} else {
 				f, p, ok := strings.Cut(raw, ":")
 				if !ok {
-					return nil, fmt.Errorf("parse discord route %s:%d: expected \"field:regex\"", path, lineNo)
+					return nil, fmt.Errorf("parse route %s:%d: expected \"field:regex\"", path, lineNo)
 				}
 				f = strings.TrimSpace(f)
 				switch f {
 				case "from", "subject", "body", "text":
 				default:
-					return nil, fmt.Errorf("parse discord route %s:%d: unknown field %q (want from, subject, body, text, or header:<name>)", path, lineNo, f)
+					return nil, fmt.Errorf("parse route %s:%d: unknown field %q (want from, subject, body, text, or header:<name>)", path, lineNo, f)
 				}
 				field = f
 				pattern = p
@@ -631,19 +988,19 @@ func loadDiscordRoutes(path string) ([]discordRoute, error) {
 
 			regex, err := regexp.Compile(pattern)
 			if err != nil {
-				return nil, fmt.Errorf("compile discord route regex %s:%d: %w", path, lineNo, err)
+				return nil, fmt.Errorf("compile route regex %s:%d: %w", path, lineNo, err)
 			}
 
 			conditions = append(conditions, routeCondition{Field: field, Regex: regex, Negate: negate})
 		}
 		if len(conditions) == 0 {
-			return nil, fmt.Errorf("parse discord route %s:%d: at least one condition is required", path, lineNo)
+			return nil, fmt.Errorf("parse route %s:%d: at least one condition is required", path, lineNo)
 		}
 
-		routes = append(routes, discordRoute{Conditions: conditions, Target: target})
+		routes = append(routes, route{Conditions: conditions, Target: target})
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read discord route file: %w", err)
+		return nil, fmt.Errorf("read route file: %w", err)
 	}
 	return routes, nil
 }
@@ -677,32 +1034,6 @@ func saveState(path string, st state) error {
 		return fmt.Errorf("encode state: %w", err)
 	}
 	return os.WriteFile(path, buf.Bytes(), 0600)
-}
-
-func postDiscord(webhookURL, content string) error {
-	body, err := json.Marshal(map[string]string{"content": content})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("discord status %s: %s", resp.Status, strings.TrimSpace(string(responseBody)))
-	}
-	return nil
 }
 
 func getenvDefault(key, fallback string) string {
